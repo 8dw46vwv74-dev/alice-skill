@@ -1,16 +1,26 @@
 import os
+import time
+import threading
 from collections import defaultdict, deque
+
 from flask import Flask, request, jsonify
 from openai import OpenAI
 
 app = Flask(__name__)
 
-client = OpenAI(
-    api_key=os.environ.get("OPENAI_API_KEY")
-)
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
+MODEL = "gpt-6-luna"
 MEMORY_SIZE = 30
+
+# Алиса ждёт ответ максимум 3 секунды, берём запас
+ALICE_WAIT_SECONDS = 2.4
+# Сколько живёт незабранный результат
+PENDING_TTL = 120
+
 histories = defaultdict(lambda: deque(maxlen=MEMORY_SIZE))
+pending = {}  # session_id -> {"done": bool, "text": str, "ts": float}
+lock = threading.Lock()
 
 SYSTEM_PROMPT = """
 Ты — голосовой помощник пользователя.
@@ -38,10 +48,29 @@ SYSTEM_PROMPT = """
 ответь коротко и заверши сессию.
 """
 
-# Встроенный веб-поиск OpenAI: отдельный ключ не нужен.
-TOOLS = [
-    {"type": "web_search"}
-]
+SEARCH_TOOLS = [{"type": "web_search"}]
+
+# Поиск подключаем только если запрос похож на «нужны свежие данные»
+SEARCH_HINTS = (
+    "погод", "температур", "дожд", "сколько стоит", "цена", "цены", "стоимост",
+    "курс", "доллар", "евро", "биткоин", "новост", "сегодня", "сейчас",
+    "вчера", "завтра", "последн", "найди", "поищи", "загугли", "в интернете",
+    "кто выиграл", "счёт", "счет", "расписание", "пробк", "купить",
+)
+
+# Фразы, которыми пользователь забирает готовый ответ
+FOLLOWUP_PHRASES = (
+    "ну что", "ну как", "что там", "нашла", "нашёл", "нашел", "готово",
+    "есть ответ", "ответ", "ну",
+)
+
+STOP_WORDS = {
+    "хватит", "стоп", "заканчивай", "закончи разговор", "заверши разговор",
+}
+RESET_WORDS = {
+    "забудь разговор", "забудь всё", "забудь все", "начни сначала",
+    "очисти память",
+}
 
 
 def get_session_id(data):
@@ -56,21 +85,67 @@ def get_session_id(data):
 def clean_text(text):
     if not text:
         return ""
-    text = text.strip()
-    return " ".join(text.split())
+    return " ".join(text.strip().split())
 
 
-def run_model(history):
-    response = client.responses.create(
-        model="gpt-6-luna",
+def needs_search(text):
+    t = text.lower()
+    return any(h in t for h in SEARCH_HINTS)
+
+
+def is_followup(text):
+    t = text.lower().strip(" ?!.,")
+    return t in FOLLOWUP_PHRASES
+
+
+def run_model(history, use_search):
+    kwargs = dict(
+        model=MODEL,
         instructions=SYSTEM_PROMPT,
         input=list(history),
-        tools=TOOLS,
-        timeout=6
+        timeout=40 if use_search else 20,
     )
-    if response.output_text:
-        return response.output_text.strip()
-    return "Я не смог сформировать ответ."
+    if use_search:
+        kwargs["tools"] = SEARCH_TOOLS
+    response = client.responses.create(**kwargs)
+    text = (response.output_text or "").strip()
+    return text or "Я не смог сформировать ответ."
+
+
+def worker(session_id, use_search, user_msg):
+    """Работает в фоне: считает ответ и кладёт его в pending и историю."""
+    history = histories[session_id]
+    try:
+        text = run_model(history, use_search)
+        with lock:
+            history.append({"role": "assistant", "content": text})
+            pending[session_id] = {"done": True, "text": text, "ts": time.time()}
+    except Exception as e:
+        print(f"OpenAI error: {e}")
+        with lock:
+            # убираем вопрос из истории, чтобы он не застрял без ответа
+            if history and history[-1] is user_msg:
+                history.pop()
+            pending[session_id] = {
+                "done": True,
+                "text": "Не получилось ответить. Попробуй сказать ещё раз.",
+                "ts": time.time(),
+            }
+
+
+def cleanup_pending():
+    now = time.time()
+    with lock:
+        for sid in [s for s, p in pending.items() if now - p["ts"] > PENDING_TTL]:
+            pending.pop(sid, None)
+
+
+def alice_response(session, text, end_session=False):
+    return jsonify({
+        "version": "1.0",
+        "session": session,
+        "response": {"text": text, "end_session": end_session},
+    })
 
 
 @app.route("/", methods=["POST"])
@@ -81,70 +156,63 @@ def alice_webhook():
     text = clean_text(request_data.get("command", ""))
     session_id = get_session_id(data)
 
+    cleanup_pending()
+
     if not text:
-        return jsonify({
-            "version": "1.0",
-            "session": session,
-            "response": {
-                "text": "Привет! Чем могу помочь?",
-                "end_session": False
-            }
-        })
+        return alice_response(session, "Привет! Чем могу помочь?")
 
-    stop_words = {
-        "хватит",
-        "стоп",
-        "заканчивай",
-        "закончи разговор",
-        "заверши разговор"
-    }
-    if text.lower() in stop_words:
-        histories.pop(session_id, None)
-        return jsonify({
-            "version": "1.0",
-            "session": session,
-            "response": {
-                "text": "Хорошо, заканчиваем.",
-                "end_session": True
-            }
-        })
+    low = text.lower()
 
-    reset_words = {
-        "забудь разговор",
-        "забудь всё",
-        "начни сначала",
-        "очисти память"
-    }
-    if text.lower() in reset_words:
-        histories.pop(session_id, None)
-        return jsonify({
-            "version": "1.0",
-            "session": session,
-            "response": {
-                "text": "Хорошо, начинаем с чистого листа.",
-                "end_session": False
-            }
-        })
+    if low in STOP_WORDS:
+        with lock:
+            histories.pop(session_id, None)
+            pending.pop(session_id, None)
+        return alice_response(session, "Хорошо, заканчиваем.", end_session=True)
 
-    history = histories[session_id]
-    history.append({"role": "user", "content": text})
+    if low in RESET_WORDS:
+        with lock:
+            histories.pop(session_id, None)
+            pending.pop(session_id, None)
+        return alice_response(session, "Хорошо, начинаем с чистого листа.")
 
-    try:
-        response_text = run_model(history)
-        history.append({"role": "assistant", "content": response_text})
-    except Exception as e:
-        print(f"OpenAI error: {e}")
-        history.pop()
-        response_text = "Что-то пошло не так. Попробуй сказать ещё раз."
+    # Есть незабранный или ещё считающийся ответ
+    with lock:
+        p = pending.get(session_id)
+        if p and p["done"]:
+            pending.pop(session_id, None)
+            return alice_response(session, p["text"])
+    if p and not p["done"]:
+        if is_followup(text):
+            return alice_response(session, "Ещё ищу. Спроси через пару секунд.")
+        # Пользователь начал новую тему, пока шёл старый запрос — ждём
+        return alice_response(
+            session, "Подожди немного, я ещё отвечаю на прошлый вопрос."
+        )
 
-    return jsonify({
-        "version": "1.0",
-        "session": session,
-        "response": {
-            "text": response_text,
-            "end_session": False
-        }
-    })
+    # Просто «ну что?» без активного запроса — это обычная реплика
+    user_msg = {"role": "user", "content": text}
+    with lock:
+        histories[session_id].append(user_msg)
+        pending[session_id] = {"done": False, "text": "", "ts": time.time()}
+
+    use_search = needs_search(text)
+    threading.Thread(
+        target=worker, args=(session_id, use_search, user_msg), daemon=True
+    ).start()
+
+    # Ждём, вдруг ответ придёт быстро
+    deadline = time.time() + ALICE_WAIT_SECONDS
+    while time.time() < deadline:
+        time.sleep(0.1)
+        with lock:
+            p = pending.get(session_id)
+            if p and p["done"]:
+                pending.pop(session_id, None)
+                return alice_response(session, p["text"])
+
+    return alice_response(
+        session, "Секунду, думаю. Спроси «ну что?» через пару секунд."
+    )
 
 
 @app.route("/", methods=["GET"])
@@ -153,7 +221,4 @@ def health():
 
 
 if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 3000))
-    )
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
