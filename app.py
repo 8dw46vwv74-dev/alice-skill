@@ -1,5 +1,3 @@
-
-code = '''
 import os
 from collections import defaultdict, deque
 from flask import Flask, request, jsonify
@@ -40,8 +38,7 @@ SYSTEM_PROMPT = """
 ответь коротко и заверши сессию.
 """
 
-# Встроенный инструмент веб-поиска OpenAI — отдельный ключ не нужен,
-# используется тот же OPENAI_API_KEY.
+# Встроенный веб-поиск OpenAI: отдельный ключ не нужен.
 TOOLS = [
     {"type": "web_search"}
 ]
@@ -71,7 +68,9 @@ def run_model(history):
         tools=TOOLS,
         timeout=6
     )
-    return response.output_text.strip() if response.output_text else "Я не смог сформировать ответ."
+    if response.output_text:
+        return response.output_text.strip()
+    return "Я не смог сформировать ответ."
 
 
 @app.route("/", methods=["POST"])
@@ -79,9 +78,7 @@ def alice_webhook():
     data = request.get_json(silent=True) or {}
     session = data.get("session", {})
     request_data = data.get("request", {})
-    text = clean_text(
-        request_data.get("command", "")
-    )
+    text = clean_text(request_data.get("command", ""))
     session_id = get_session_id(data)
 
     if not text:
@@ -130,24 +127,15 @@ def alice_webhook():
         })
 
     history = histories[session_id]
-    history.append({
-        "role": "user",
-        "content": text
-    })
+    history.append({"role": "user", "content": text})
 
     try:
         response_text = run_model(history)
-        history.append({
-            "role": "assistant",
-            "content": response_text
-        })
+        history.append({"role": "assistant", "content": response_text})
     except Exception as e:
         print(f"OpenAI error: {e}")
         history.pop()
-        response_text = (
-            "Что-то пошло не так. "
-            "Попробуй сказать ещё раз."
-        )
+        response_text = "Что-то пошло не так. Попробуй сказать ещё раз."
 
     return jsonify({
         "version": "1.0",
@@ -169,5 +157,3 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 3000))
     )
-'''
-print(len(code))
