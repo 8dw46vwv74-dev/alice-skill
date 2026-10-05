@@ -1,7 +1,6 @@
 
 code = '''
 import os
-import requests
 from collections import defaultdict, deque
 from flask import Flask, request, jsonify
 from openai import OpenAI
@@ -11,8 +10,6 @@ app = Flask(__name__)
 client = OpenAI(
     api_key=os.environ.get("OPENAI_API_KEY")
 )
-
-SERPAPI_KEY = os.environ.get("SERPAPI_KEY")
 
 MEMORY_SIZE = 30
 histories = defaultdict(lambda: deque(maxlen=MEMORY_SIZE))
@@ -28,8 +25,7 @@ SYSTEM_PROMPT = """
 Если предыдущая реплика помогает понять текущую — обязательно используй её.
 Не выдумывай факты.
 Если нужны свежие данные — погода, цены, новости, курсы валют, любые
-актуальные факты — используй инструмент поиска вместо того, чтобы
-придумывать ответ.
+актуальные факты — используй веб-поиск вместо того, чтобы придумывать ответ.
 Если информации недостаточно — нормально скажи, чего именно не хватает,
 или задай короткий уточняющий вопрос.
 Отвечай на русском языке.
@@ -44,62 +40,11 @@ SYSTEM_PROMPT = """
 ответь коротко и заверши сессию.
 """
 
+# Встроенный инструмент веб-поиска OpenAI — отдельный ключ не нужен,
+# используется тот же OPENAI_API_KEY.
 TOOLS = [
-    {
-        "type": "function",
-        "name": "web_search",
-        "description": (
-            "Поиск в интернете свежей информации: погода, цены, курсы валют, "
-            "новости и любые актуальные факты, которые модель не может знать "
-            "заранее."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Поисковый запрос на русском или английском языке."
-                }
-            },
-            "required": ["query"]
-        }
-    }
+    {"type": "web_search"}
 ]
-
-
-def web_search(query):
-    """Делает реальный запрос к поисковику через SerpAPI и возвращает
-    краткую выжимку результатов."""
-    if not SERPAPI_KEY:
-        return "Поиск недоступен: не настроен ключ поиска."
-    try:
-        resp = requests.get(
-            "https://serpapi.com/search",
-            params={
-                "q": query,
-                "hl": "ru",
-                "gl": "ru",
-                "api_key": SERPAPI_KEY
-            },
-            timeout=5
-        )
-        data = resp.json()
-        pieces = []
-        answer_box = data.get("answer_box")
-        if answer_box:
-            snippet = answer_box.get("answer") or answer_box.get("snippet")
-            if snippet:
-                pieces.append(snippet)
-        for result in data.get("organic_results", [])[:3]:
-            snippet = result.get("snippet")
-            if snippet:
-                pieces.append(snippet)
-        if not pieces:
-            return "Ничего конкретного не нашлось."
-        return " / ".join(pieces[:4])
-    except Exception as e:
-        print(f"Search error: {e}")
-        return "Поиск сейчас недоступен."
 
 
 def get_session_id(data):
@@ -119,49 +64,13 @@ def clean_text(text):
 
 
 def run_model(history):
-    """Запускает модель, при необходимости выполняет вызовы инструментов
-    и возвращает финальный текстовый ответ."""
-    input_items = list(history)
-
     response = client.responses.create(
         model="gpt-6-luna",
         instructions=SYSTEM_PROMPT,
-        input=input_items,
+        input=list(history),
         tools=TOOLS,
-        timeout=4
+        timeout=6
     )
-
-    # Обрабатываем возможные вызовы инструментов (может быть несколько раундов).
-    for _ in range(3):
-        tool_calls = [
-            item for item in response.output
-            if getattr(item, "type", None) == "function_call"
-        ]
-        if not tool_calls:
-            break
-
-        input_items += response.output
-        for call in tool_calls:
-            if call.name == "web_search":
-                import json
-                args = json.loads(call.arguments or "{}")
-                result = web_search(args.get("query", ""))
-            else:
-                result = "Инструмент не найден."
-            input_items.append({
-                "type": "function_call_output",
-                "call_id": call.call_id,
-                "output": result
-            })
-
-        response = client.responses.create(
-            model="gpt-6-luna",
-            instructions=SYSTEM_PROMPT,
-            input=input_items,
-            tools=TOOLS,
-            timeout=4
-        )
-
     return response.output_text.strip() if response.output_text else "Я не смог сформировать ответ."
 
 
@@ -262,4 +171,3 @@ if __name__ == "__main__":
     )
 '''
 print(len(code))
-
